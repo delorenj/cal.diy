@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import process from "node:process";
 import { updateProfilePhotoGoogle } from "@calcom/app-store/_utils/oauth/updateProfilePhotoGoogle";
 import { updateProfilePhotoMicrosoft } from "@calcom/app-store/_utils/oauth/updateProfilePhotoMicrosoft";
@@ -23,6 +24,7 @@ import {
   IS_TEAM_BILLING_ENABLED,
   MICROSOFT_CALENDAR_SCOPES,
   WEBAPP_URL,
+  WEBSITE_URL,
 } from "@calcom/lib/constants";
 import { symmetricDecrypt, symmetricEncrypt } from "@calcom/lib/crypto";
 import { defaultCookies } from "@calcom/lib/default-cookies";
@@ -41,6 +43,7 @@ import type { UserProfile } from "@calcom/types/UserProfile";
 import { calendar_v3 } from "@googleapis/calendar";
 import { waitUntil } from "@vercel/functions";
 import { OAuth2Client } from "googleapis-common";
+import { jwtVerify } from "jose";
 import type { Account, AuthOptions, Profile, Session, User } from "next-auth";
 import type { JWT } from "next-auth/jwt";
 import { encode } from "next-auth/jwt";
@@ -109,6 +112,51 @@ const getDomainFromEmail = (email: string): string => email.split("@")[1];
 const loginWithTotp = async (email: string) =>
   `/auth/login?totp=${encodeURIComponent(await (await import("./signJwt")).default({ email }))}`;
 
+type LoginCredentials = {
+  email: string;
+  password?: string;
+  totpCode?: string;
+  backupCode?: string;
+  totpToken?: string;
+};
+
+const OAUTH_IDENTITY_PROVIDERS = new Set<IdentityProvider>([
+  IdentityProvider.GOOGLE,
+  IdentityProvider.SAML,
+  IdentityProvider.AZUREAD,
+]);
+
+const normalizeEmail = (email: string) => email.trim().toLowerCase();
+
+const verifyOAuthTotpContinuation = async (token: string, user: UserWithProfiles) => {
+  if (!OAUTH_IDENTITY_PROVIDERS.has(user.identityProvider)) return false;
+
+  const encryptionKey = process.env.CALENDSO_ENCRYPTION_KEY;
+  if (!encryptionKey) {
+    log.error("Missing encryption key; cannot verify OAuth two-factor continuation.");
+    throw new Error(ErrorCode.InternalServerError);
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, Buffer.from(encryptionKey, "utf8"), {
+      issuer: WEBSITE_URL,
+      audience: `${WEBSITE_URL}/auth/login`,
+      algorithms: ["HS256"],
+      maxTokenAge: "2m",
+    });
+    const userEmail = normalizeEmail(user.email);
+
+    return (
+      typeof payload.email === "string" &&
+      typeof payload.sub === "string" &&
+      normalizeEmail(payload.email) === userEmail &&
+      normalizeEmail(payload.sub) === userEmail
+    );
+  } catch {
+    return false;
+  }
+};
+
 type UserTeams = {
   teams: (Membership & {
     team: Pick<Team, "metadata">;
@@ -148,10 +196,16 @@ const checkIfUserShouldBelongToOrg = async (idP: IdentityProvider, email: string
  * Authorize function for credentials provider
  * Extracted for testability
  */
-export async function authorizeCredentials(
-  credentials: Record<"email" | "password" | "totpCode" | "backupCode", string> | undefined
-): Promise<User | null> {
-  log.debug("CredentialsProvider:credentials:authorize", safeStringify({ credentials }));
+export async function authorizeCredentials(credentials: LoginCredentials | undefined): Promise<User | null> {
+  log.debug(
+    "CredentialsProvider:credentials:authorize",
+    safeStringify({
+      hasPassword: !!credentials?.password,
+      hasTotpCode: !!credentials?.totpCode,
+      hasBackupCode: !!credentials?.backupCode,
+      hasTotpToken: !!credentials?.totpToken,
+    })
+  );
   if (!credentials) {
     console.error(`For some reason credentials are missing`);
     throw new Error(ErrorCode.InternalServerError);
@@ -175,15 +229,25 @@ export async function authorizeCredentials(
     identifier: hashEmail(user.email),
   });
 
-  // Users without a password must use their identity provider (Google/SAML) to login
-  if (!user.password?.hash) {
-    throw new Error(ErrorCode.IncorrectEmailPassword);
+  const hasSecondFactor = !!(credentials.totpCode || credentials.backupCode);
+  let isOAuthTotpContinuation = false;
+  if (credentials.totpToken && user.twoFactorEnabled && hasSecondFactor) {
+    isOAuthTotpContinuation = await verifyOAuthTotpContinuation(credentials.totpToken, user);
+    if (!isOAuthTotpContinuation) {
+      throw new Error(ErrorCode.IncorrectEmailPassword);
+    }
   }
 
-  // Always verify password for users who have one
-  const isCorrectPassword = await verifyPassword(credentials.password, user.password.hash);
-  if (!isCorrectPassword) {
-    throw new Error(ErrorCode.IncorrectEmailPassword);
+  if (!isOAuthTotpContinuation) {
+    // Users without a password must use their identity provider (Google/SAML/Azure AD) to login.
+    if (!user.password?.hash) {
+      throw new Error(ErrorCode.IncorrectEmailPassword);
+    }
+
+    const isCorrectPassword = await verifyPassword(credentials.password ?? "", user.password.hash);
+    if (!isCorrectPassword) {
+      throw new Error(ErrorCode.IncorrectEmailPassword);
+    }
   }
 
   if (user.twoFactorEnabled && credentials.backupCode) {
@@ -257,7 +321,7 @@ export async function authorizeCredentials(
     }
 
     // User's password is valid and two-factor authentication is enabled
-    if (isPasswordValid(credentials.password, false, true) && user.twoFactorEnabled) return role;
+    if (isPasswordValid(credentials.password ?? "", false, true) && user.twoFactorEnabled) return role;
     // Code is running in a development environment
     if (isENVDev) return role;
     // By this point it is an ADMIN without valid security conditions
@@ -268,7 +332,7 @@ export async function authorizeCredentials(
   const baseUser = AdapterUserPresenter.fromCalUser(user, role, hasActiveTeams);
 
   if (role === "INACTIVE_ADMIN") {
-    const passwordValid = isPasswordValid(credentials.password, false, true);
+    const passwordValid = isPasswordValid(credentials.password ?? "", false, true);
     const has2FA = user.twoFactorEnabled;
 
     let reason: "both" | "password" | "2fa";
@@ -296,6 +360,7 @@ export const CalComCredentialsProvider = CredentialsProvider({
     password: { label: "Password", type: "password", placeholder: "Your super secure password" },
     totpCode: { label: "Two-factor Code", type: "input", placeholder: "Code from authenticator app" },
     backupCode: { label: "Backup Code", type: "input", placeholder: "Two-factor backup code" },
+    totpToken: { label: "Two-factor continuation token", type: "hidden" },
   },
   authorize: authorizeCredentials,
 });
@@ -798,7 +863,14 @@ export const getOptions = ({
         account,
       } = params;
 
-      log.debug("callbacks:signin", safeStringify(params));
+      log.debug(
+        "callbacks:signin",
+        safeStringify({
+          account: account ? { provider: account.provider, type: account.type } : null,
+          hasUser: !!user,
+          hasProfile: !!profile,
+        })
+      );
 
       if (account?.provider === "email") {
         return true;

@@ -8,10 +8,10 @@ import { useCompatSearchParams } from "@calcom/lib/hooks/useCompatSearchParams";
 import { useLocale } from "@calcom/lib/hooks/useLocale";
 import { Alert } from "@calcom/ui/components/alert";
 import { Icon } from "@calcom/ui/components/icon";
+import AddToHomescreen from "@calcom/web/components/AddToHomescreen";
+import BackupCode from "@calcom/web/components/auth/BackupCode";
+import TwoFactor from "@calcom/web/components/auth/TwoFactor";
 import { LastUsed, useLastUsed } from "@calcom/web/modules/auth/hooks/useLastUsed";
-import AddToHomescreen from "@components/AddToHomescreen";
-import BackupCode from "@components/auth/BackupCode";
-import TwoFactor from "@components/auth/TwoFactor";
 import { Button } from "@coss/ui/components/button";
 import { Field, FieldLabel } from "@coss/ui/components/field";
 import { Input } from "@coss/ui/components/input";
@@ -34,15 +34,12 @@ interface LoginValues {
   totpCode: string;
   backupCode: string;
   csrfToken: string;
+  totpToken?: string;
 }
 
-const MicrosoftIcon = () => (
-  <img className="size-4" src="/microsoft-logo.svg" alt="" />
-);
+const MicrosoftIcon = () => <img className="size-4" src="/microsoft-logo.svg" alt="" />;
 
-const GoogleIcon = () => (
-  <img className="size-4" src="/google-icon-colored.svg" alt="" />
-);
+const GoogleIcon = () => <img className="size-4" src="/google-icon-colored.svg" alt="" />;
 
 function BackgroundGrid() {
   const rows = 9;
@@ -120,7 +117,10 @@ export default function Login({
     })
     // Passthrough other fields like totpCode
     .passthrough();
-  const methods = useForm<LoginValues>({ resolver: zodResolver(formSchema) });
+  const methods = useForm<LoginValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: totpEmail ? { email: totpEmail } : undefined,
+  });
   const { register, formState } = methods;
   const [twoFactorRequired, setTwoFactorRequired] = useState(!!totpEmail || false);
   const [twoFactorLostAccess, setTwoFactorLostAccess] = useState(false);
@@ -152,9 +152,23 @@ export default function Login({
 
   const onSubmit = async (values: LoginValues) => {
     setErrorMessage(null);
+    const credentials: Partial<LoginValues> = { ...values };
+
+    if (totpEmail) {
+      const totpToken = searchParams?.get("totp");
+      if (!totpToken) {
+        setErrorMessage(errorMessages[ErrorCode.InternalServerError]);
+        return;
+      }
+
+      credentials.email = totpEmail;
+      credentials.totpToken = totpToken;
+      delete credentials.password;
+    }
+
     // telemetry.event(telemetryEventTypes.login, collectPageParameters());
     const res = await signIn<"credentials">("credentials", {
-      ...values,
+      ...credentials,
       callbackUrl,
       redirect: false,
     });
@@ -243,6 +257,7 @@ export default function Login({
 
             <form onSubmit={methods.handleSubmit(onSubmit)} noValidate data-testid="login-form">
               <input defaultValue={csrfToken || undefined} type="hidden" hidden {...register("csrfToken")} />
+              {totpEmail && <input type="hidden" hidden {...register("email")} />}
 
               {!twoFactorRequired && (
                 <div className="space-y-6">
@@ -302,6 +317,11 @@ export default function Login({
               {twoFactorRequired && (
                 <div className="space-y-4">
                   {!twoFactorLostAccess ? <TwoFactor center /> : <BackupCode center />}
+                  {totpEmail && formState.errors.email && (
+                    <p data-testid="field-error" className="text-destructive-foreground text-xs">
+                      {formState.errors.email.message}
+                    </p>
+                  )}
                 </div>
               )}
 

@@ -1,6 +1,13 @@
+/**
+ * @vitest-environment node
+ */
+import { Buffer } from "node:buffer";
 import { IdentityProvider, UserPermissionRole } from "@calcom/prisma/enums";
+import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCode } from "./ErrorCode";
+
+const mockLogDebug = vi.hoisted(() => vi.fn());
 
 // Mock dependencies
 vi.mock("@calcom/prisma", () => ({
@@ -64,13 +71,14 @@ vi.mock("@calcom/lib/constants", async (importOriginal) => {
     IS_TEAM_BILLING_ENABLED: false,
     ENABLE_PROFILE_SWITCHER: false,
     WEBAPP_URL: "http://localhost:3000",
+    WEBSITE_URL: "http://localhost:3000",
   };
 });
 
 vi.mock("@calcom/lib/logger", () => ({
   default: {
     getSubLogger: vi.fn(() => ({
-      debug: vi.fn(),
+      debug: mockLogDebug,
       error: vi.fn(),
       info: vi.fn(),
       warn: vi.fn(),
@@ -237,7 +245,59 @@ describe("CredentialsProvider authorize", () => {
     ...overrides,
   });
 
+  const encryptionKey = "oauth-totp-continuation-test-key";
+  const websiteUrl = "http://localhost:3000";
+
+  const createOAuthTotpToken = async ({
+    email = "test@example.com",
+    subject = email,
+    issuer = websiteUrl,
+    audience = `${websiteUrl}/auth/login`,
+    secret = encryptionKey,
+    issuedAt = Math.floor(Date.now() / 1000),
+    expirationTime = "2m",
+  }: {
+    email?: string;
+    subject?: string;
+    issuer?: string;
+    audience?: string;
+    secret?: string;
+    issuedAt?: number;
+    expirationTime?: string | number;
+  } = {}) =>
+    new SignJWT({ email })
+      .setProtectedHeader({ alg: "HS256" })
+      .setSubject(subject)
+      .setIssuedAt(issuedAt)
+      .setIssuer(issuer)
+      .setAudience(audience)
+      .setExpirationTime(expirationTime)
+      .sign(Buffer.from(secret, "utf8"));
+
+  const mockValidTotp = async () => {
+    const { symmetricDecrypt } = await import("@calcom/lib/crypto");
+    vi.mocked(symmetricDecrypt).mockReturnValue("a".repeat(32));
+
+    const { totpAuthenticatorCheck } = await import("@calcom/lib/totp");
+    vi.mocked(totpAuthenticatorCheck).mockReturnValue(true);
+    return totpAuthenticatorCheck;
+  };
+
   describe("Password validation", () => {
+    it("continues to authenticate a normal password login", async () => {
+      vi.mocked(verifyPassword).mockResolvedValue(true);
+      const mockUser = createMockUser();
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      const result = await authorizeCredentials({
+        email: mockUser.email,
+        password: "password123",
+      });
+
+      expect(result?.id).toBe(mockUser.id);
+      expect(verifyPassword).toHaveBeenCalledWith("password123", mockUser.password.hash);
+    });
+
     it("should throw error when user has no password hash with CAL identity provider", async () => {
       const mockUser = createMockUser({
         password: null,
@@ -329,6 +389,248 @@ describe("CredentialsProvider authorize", () => {
           totpCode: "123456",
         } as any)
       ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+    });
+  });
+
+  describe("OAuth TOTP continuation", () => {
+    const originalEncryptionKey = process.env.CALENDSO_ENCRYPTION_KEY;
+
+    beforeEach(() => {
+      process.env.CALENDSO_ENCRYPTION_KEY = encryptionKey;
+    });
+
+    afterEach(() => {
+      if (originalEncryptionKey === undefined) {
+        delete process.env.CALENDSO_ENCRYPTION_KEY;
+      } else {
+        process.env.CALENDSO_ENCRYPTION_KEY = originalEncryptionKey;
+      }
+    });
+
+    it.each([
+      IdentityProvider.GOOGLE,
+      IdentityProvider.SAML,
+      IdentityProvider.AZUREAD,
+    ])("allows a valid %s continuation to proceed to normal TOTP validation", async (identityProvider) => {
+      const totpAuthenticatorCheck = await mockValidTotp();
+      const mockUser = createMockUser({
+        identityProvider,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      const result = await authorizeCredentials({
+        email: mockUser.email,
+        totpCode: "123456",
+        totpToken: await createOAuthTotpToken(),
+      });
+
+      expect(result?.id).toBe(mockUser.id);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(totpAuthenticatorCheck).toHaveBeenCalledWith("123456", "a".repeat(32));
+    });
+
+    it("rejects a bare OAuth email and TOTP without a continuation token", async () => {
+      const { totpAuthenticatorCheck } = await import("@calcom/lib/totp");
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(authorizeCredentials({ email: mockUser.email, totpCode: "123456" })).rejects.toThrow(
+        ErrorCode.IncorrectEmailPassword
+      );
+      expect(totpAuthenticatorCheck).not.toHaveBeenCalled();
+    });
+
+    it("does not treat a valid continuation token without a second-factor code as authentication", async () => {
+      vi.mocked(verifyPassword).mockResolvedValue(false);
+      const { totpAuthenticatorCheck } = await import("@calcom/lib/totp");
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpToken: await createOAuthTotpToken(),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+      expect(verifyPassword).toHaveBeenCalledWith("", mockUser.password.hash);
+      expect(totpAuthenticatorCheck).not.toHaveBeenCalled();
+    });
+
+    it("preserves backup-code validation for a valid OAuth continuation", async () => {
+      const { symmetricDecrypt, symmetricEncrypt } = await import("@calcom/lib/crypto");
+      vi.mocked(symmetricDecrypt).mockReturnValue(JSON.stringify(["abc123"]));
+      vi.mocked(symmetricEncrypt).mockReturnValue("updated_encrypted_backup_codes");
+      const prismaModule = await import("@calcom/prisma");
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        twoFactorEnabled: true,
+        backupCodes: "encrypted_backup_codes",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      const result = await authorizeCredentials({
+        email: mockUser.email,
+        backupCode: "abc-123",
+        totpToken: await createOAuthTotpToken(),
+      });
+
+      expect(result?.id).toBe(mockUser.id);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(prismaModule.default.user.update).toHaveBeenCalledWith({
+        where: { id: mockUser.id },
+        data: { backupCodes: "updated_encrypted_backup_codes" },
+      });
+    });
+
+    it.each([
+      ["invalid signature", () => createOAuthTotpToken({ secret: "wrong-key" })],
+      ["invalid issuer", () => createOAuthTotpToken({ issuer: "https://attacker.example" })],
+      ["invalid audience", () => createOAuthTotpToken({ audience: `${websiteUrl}/wrong-path` })],
+    ])("rejects a token with an %s", async (_label, createToken) => {
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "123456",
+          totpToken: await createToken(),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+    });
+
+    it("rejects an expired continuation token", async () => {
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "123456",
+          totpToken: await createOAuthTotpToken({ expirationTime: Math.floor(Date.now() / 1000) - 1 }),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+    });
+
+    it("rejects a token older than the continuation window even when its expiration is later", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "123456",
+          totpToken: await createOAuthTotpToken({ issuedAt: now - 121, expirationTime: now + 60 }),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+    });
+
+    it.each([
+      ["email", { email: "another@example.com" }],
+      ["subject", { subject: "another@example.com" }],
+    ])("rejects a token whose %s does not match the located user", async (_claim, tokenClaims) => {
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "123456",
+          totpToken: await createOAuthTotpToken(tokenClaims),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+    });
+
+    it("does not allow a CAL user to use an OAuth continuation token", async () => {
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.CAL,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "123456",
+          totpToken: await createOAuthTotpToken(),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectEmailPassword);
+      expect(verifyPassword).not.toHaveBeenCalled();
+    });
+
+    it("still rejects an incorrect TOTP after a valid continuation", async () => {
+      const { symmetricDecrypt } = await import("@calcom/lib/crypto");
+      vi.mocked(symmetricDecrypt).mockReturnValue("a".repeat(32));
+      const { totpAuthenticatorCheck } = await import("@calcom/lib/totp");
+      vi.mocked(totpAuthenticatorCheck).mockReturnValue(false);
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "000000",
+          totpToken: await createOAuthTotpToken(),
+        })
+      ).rejects.toThrow(ErrorCode.IncorrectTwoFactorCode);
+      expect(verifyPassword).not.toHaveBeenCalled();
+    });
+
+    it("fails closed when the continuation verification key is unavailable", async () => {
+      delete process.env.CALENDSO_ENCRYPTION_KEY;
+      const mockUser = createMockUser({
+        identityProvider: IdentityProvider.GOOGLE,
+        password: null,
+        twoFactorEnabled: true,
+        twoFactorSecret: "encrypted_secret",
+      });
+      mockFindByEmailAndIncludeProfilesAndPassword.mockResolvedValue(mockUser);
+
+      await expect(
+        authorizeCredentials({
+          email: mockUser.email,
+          totpCode: "123456",
+          totpToken: "signed-token",
+        })
+      ).rejects.toThrow(ErrorCode.InternalServerError);
     });
   });
 
@@ -505,6 +807,35 @@ describe("Azure AD signIn callback", () => {
     getOptions = authModule.getOptions;
     const options = getOptions({ getDubId: () => undefined, getTrackingData: () => ({}) as any });
     signInCallback = options.callbacks!.signIn! as any;
+  });
+
+  it("does not log credential or second-factor values in the sign-in callback", async () => {
+    const result = await signInCallback({
+      user: { id: "1", email: "user@example.com", name: "User" },
+      account: {
+        provider: "credentials",
+        providerAccountId: "1",
+        type: "credentials",
+      },
+      credentials: {
+        email: "user@example.com",
+        password: "password-secret",
+        totpCode: "123456",
+        backupCode: "backup-secret",
+        totpToken: "continuation-secret",
+      },
+    } as any);
+
+    expect(result).toBe(true);
+    const callbackLog = mockLogDebug.mock.calls.find(([event]) => event === "callbacks:signin");
+    expect(callbackLog).toBeDefined();
+    expect(callbackLog?.[1]).toBe(
+      JSON.stringify({
+        account: { provider: "credentials", type: "credentials" },
+        hasUser: true,
+        hasProfile: false,
+      })
+    );
   });
 
   describe("Azure AD email verification (xms_edov)", () => {

@@ -436,6 +436,9 @@ Note: `docker compose` without the hyphen is now the primary method of using doc
    VAPID_PRIVATE_KEY=your_private_key_here
    ```
 
+   `NEXT_PUBLIC_VAPID_PUBLIC_KEY` must also be present while building the web image because Next.js
+   embeds it in the browser bundle. Setting it only on the running container does not update the client.
+
    Do **not** commit real keys to `.env.example` — only placeholders.
 
    Update the appropriate values in your .env file, then proceed.

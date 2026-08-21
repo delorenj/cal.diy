@@ -1,9 +1,8 @@
 "use client";
 
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
-
 import { trpc } from "@calcom/trpc/react";
 import { showToast } from "@calcom/ui/components/toast";
+import { createContext, useEffect, useMemo, useState } from "react";
 
 interface WebPushContextProps {
   permission: NotificationPermission;
@@ -18,6 +17,10 @@ export const WebPushContext = createContext<WebPushContextProps | null>(null);
 interface ProviderProps {
   children: React.ReactNode;
 }
+
+const VAPID_PUBLIC_KEY_BYTE_LENGTH = 65;
+const UNCOMPRESSED_POINT_PREFIX = 0x04;
+const PUSH_NOTIFICATIONS_CONFIGURATION_ERROR = "Push notifications are not configured on this server";
 
 export function WebPushProvider({ children }: ProviderProps) {
   const [permission, setPermission] = useState<NotificationPermission>(() =>
@@ -57,13 +60,23 @@ export function WebPushProvider({ children }: ProviderProps) {
       subscribe: async () => {
         try {
           setIsLoading(true);
+          const applicationServerKey = decodeVapidPublicKey(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY);
+
+          if (!applicationServerKey) {
+            console.error(
+              "Push notification configuration is invalid: NEXT_PUBLIC_VAPID_PUBLIC_KEY must be an uncompressed P-256 public key"
+            );
+            showToast(PUSH_NOTIFICATIONS_CONFIGURATION_ERROR, "error");
+            return;
+          }
+
           const newPermission = await Notification.requestPermission();
           setPermission(newPermission);
 
           if (newPermission === "granted" && pushManager) {
             const subscription = await pushManager.subscribe({
               userVisibleOnly: true,
-              applicationServerKey: urlB64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || ""),
+              applicationServerKey,
             });
             addSubscription({ subscription: JSON.stringify(subscription) });
             setIsSubscribed(true);
@@ -76,7 +89,7 @@ export function WebPushProvider({ children }: ProviderProps) {
             error.name === "InvalidAccessError" &&
             error.message.includes("applicationServerKey")
           ) {
-            showToast("Please enable Google services for push messaging and try again", "error");
+            showToast(PUSH_NOTIFICATIONS_CONFIGURATION_ERROR, "error");
           } else {
             showToast("Failed to enable notifications", "error");
           }
@@ -110,13 +123,30 @@ export function WebPushProvider({ children }: ProviderProps) {
   return <WebPushContext.Provider value={contextValue}>{children}</WebPushContext.Provider>;
 }
 
-const urlB64ToUint8Array = (base64String: string) => {
-  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding).replace(/\-/g, "+").replace(/_/g, "/");
-  const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-  for (let i = 0; i < rawData.length; ++i) {
-    outputArray[i] = rawData.charCodeAt(i);
+export function decodeVapidPublicKey(base64Url: string | undefined): Uint8Array | null {
+  if (!base64Url || !/^[A-Za-z0-9_-]+={0,2}$/.test(base64Url)) return null;
+
+  const unpaddedBase64Url = base64Url.replace(/=+$/, "");
+  if (unpaddedBase64Url.length % 4 === 1) return null;
+
+  const padding = "=".repeat((4 - (unpaddedBase64Url.length % 4)) % 4);
+  const base64 = (unpaddedBase64Url + padding).replace(/-/g, "+").replace(/_/g, "/");
+
+  try {
+    const rawData = globalThis.atob(base64);
+    if (
+      rawData.length !== VAPID_PUBLIC_KEY_BYTE_LENGTH ||
+      rawData.charCodeAt(0) !== UNCOMPRESSED_POINT_PREFIX
+    ) {
+      return null;
+    }
+
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; ++i) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+  } catch {
+    return null;
   }
-  return outputArray;
-};
+}

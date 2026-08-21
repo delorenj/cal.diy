@@ -123,7 +123,7 @@ export function WebPushProvider({ children }: ProviderProps) {
   return <WebPushContext.Provider value={contextValue}>{children}</WebPushContext.Provider>;
 }
 
-export function decodeVapidPublicKey(base64Url: string | undefined): Uint8Array | null {
+export function decodeVapidPublicKey(base64Url: string | undefined): Uint8Array<ArrayBuffer> | null {
   if (!base64Url || !/^[A-Za-z0-9_-]+={0,2}$/.test(base64Url)) return null;
 
   const unpaddedBase64Url = base64Url.replace(/=+$/, "");
